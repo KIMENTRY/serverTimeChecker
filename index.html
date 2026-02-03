@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Server Time Checker</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 20px; color: #111; }
+    .row { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+    #clock { font-size: 32px; font-weight: 600; margin: 12px 0; }
+    #error { color: #b00020; margin-top: 8px; min-height: 1.2em; }
+    #debug { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; }
+    input[type="text"] { flex: 1; padding: 6px 8px; }
+  </style>
+</head>
+<body>
+  <div class="row">
+    <input id="serverUrl" type="text" placeholder="https://example.com" spellcheck="false">
+    <button id="syncBtn" type="button">Sync</button>
+  </div>
+  <div class="row">
+    <label><input id="showMs" type="checkbox"> Show milliseconds</label>
+  </div>
+  <div id="clock"></div>
+  <div id="debug"></div>
+  <div id="error"></div>
+
+  <script>
+    const serverUrlInput = document.getElementById('serverUrl');
+    const syncBtn = document.getElementById('syncBtn');
+    const showMs = document.getElementById('showMs');
+    const clockEl = document.getElementById('clock');
+    const debugEl = document.getElementById('debug');
+    const errorEl = document.getElementById('error');
+
+    const clockTextNode = document.createTextNode('');
+    clockEl.appendChild(clockTextNode);
+
+    let syncInProgress = false;
+    let resyncTimer = 0;
+
+    let baseServerTime = 0;
+    let basePerfTime = 0;
+    let currentOffset = 0;
+    let targetOffset = 0;
+    let lastOffset = 0;
+    let hasSync = false;
+
+    function setError(message) {
+      errorEl.textContent = message || '';
+    }
+
+    function formatTime(ms, withMs) {
+      const d = new Date(ms);
+      const hh = d.getUTCHours();
+      const mm = d.getUTCMinutes();
+      const ss = d.getUTCSeconds();
+      const msec = d.getUTCMilliseconds();
+      const h = hh < 10 ? '0' + hh : '' + hh;
+      const m = mm < 10 ? '0' + mm : '' + mm;
+      const s = ss < 10 ? '0' + ss : '' + ss;
+      if (withMs) {
+        let msStr = '' + msec;
+        if (msec < 10) msStr = '00' + msec;
+        else if (msec < 100) msStr = '0' + msec;
+        return h + ':' + m + ':' + s + '.' + msStr;
+      }
+      return h + ':' + m + ':' + s;
+    }
+
+    function updateDebug(offset, minRtt, stdDev, used) {
+      debugEl.textContent =
+        'offset(ms): ' + offset.toFixed(3) + '\n' +
+        'min RTT(ms): ' + minRtt.toFixed(3) + '\n' +
+        'RTT stddev(ms): ' + stdDev.toFixed(3) + '\n' +
+        'samples used: ' + used;
+    }
+
+    function validateUrl(url) {
+      try {
+        const u = new URL(url);
+        return u.protocol === 'http:' || u.protocol === 'https:';
+      } catch (e) {
+        return false;
+      }
+    }
+
+    async function measureOnce(target) {
+      const t0 = performance.now();
+      const resp = await fetch('/proxy?url=' + encodeURIComponent(target), { method: 'GET' });
+      const t1 = performance.now();
+      if (!resp.ok) throw new Error('Proxy returned ' + resp.status);
+      const data = await resp.json();
+      if (!data || !data.date) throw new Error('Missing date field');
+      const serverDate = Date.parse(data.date);
+      if (!Number.isFinite(serverDate)) throw new Error('Invalid date');
+      const clientReceiveTime = Date.now();
+      const rtt = t1 - t0;
+      const estimatedServer = serverDate + rtt / 2;
+      const offset = estimatedServer - clientReceiveTime;
+      return { rtt, offset };
+    }
+
+    function computeStats(samples) {
+      samples.sort((a, b) => a.rtt - b.rtt);
+      const keepCount = Math.max(1, Math.floor(samples.length * 0.25));
+      const kept = samples.slice(0, keepCount);
+
+      let minRtt = kept[0].rtt;
+      let sum = 0;
+      for (let i = 0; i < kept.length; i++) sum += kept[i].rtt;
+      const mean = sum / kept.length;
+      let varianceSum = 0;
+      for (let i = 0; i < kept.length; i++) {
+        const diff = kept[i].rtt - mean;
+        varianceSum += diff * diff;
+      }
+      const stdDev = Math.sqrt(varianceSum / kept.length);
+
+      const weighted = kept.slice().sort((a, b) => a.offset - b.offset);
+      let weightSum = 0;
+      for (let i = 0; i < weighted.length; i++) weightSum += 1 / weighted[i].rtt;
+      let cumulative = 0;
+      let median = weighted[weighted.length - 1].offset;
+      for (let i = 0; i < weighted.length; i++) {
+        cumulative += (1 / weighted[i].rtt) / weightSum;
+        if (cumulative >= 0.5) {
+          median = weighted[i].offset;
+          break;
+        }
+      }
+      return { targetOffset: median, minRtt, stdDev, used: kept.length };
+    }
+
+    async function runSync() {
+      if (syncInProgress) return;
+      const target = serverUrlInput.value.trim();
+      if (!validateUrl(target)) {
+        setError('Please enter a valid http or https URL.');
+        return;
+      }
+      syncInProgress = true;
+      try {
+        const samples = [];
+        for (let i = 0; i < 50; i++) {
+          if (i > 0) {
+            const delay = 5 + Math.random() * 5;
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
+          samples.push(await measureOnce(target));
+        }
+        const stats = computeStats(samples);
+        targetOffset = stats.targetOffset;
+        if (!hasSync) {
+          currentOffset = targetOffset;
+          lastOffset = currentOffset;
+          baseServerTime = Date.now() + currentOffset;
+          basePerfTime = performance.now();
+          hasSync = true;
+        }
+        updateDebug(targetOffset, stats.minRtt, stats.stdDev, stats.used);
+        setError('');
+      } catch (e) {
+        setError(e && e.message ? e.message : 'Sync failed');
+      } finally {
+        syncInProgress = false;
+      }
+    }
+
+    function tick() {
+      if (hasSync) {
+        currentOffset += (targetOffset - currentOffset) * 0.02;
+        const delta = currentOffset - lastOffset;
+        if (delta !== 0) {
+          baseServerTime += delta;
+          lastOffset = currentOffset;
+        }
+        const now = baseServerTime + (performance.now() - basePerfTime);
+        clockTextNode.nodeValue = formatTime(now, showMs.checked);
+      } else {
+        clockTextNode.nodeValue = '--:--:--';
+      }
+      requestAnimationFrame(tick);
+    }
+
+    syncBtn.addEventListener('click', () => {
+      runSync();
+      if (!resyncTimer) {
+        resyncTimer = setInterval(runSync, 10000);
+      }
+    });
+
+    requestAnimationFrame(tick);
+  </script>
+</body>
+</html>
